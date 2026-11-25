@@ -1,0 +1,6 @@
+20260302 no previous VIX date for the open-time VIX columns
+20260407 no full-day high/low for the truth (capture ended early)
+20260416 no full-day high/low for the truth (capture ended early)
+20260421 no full-day high/low for the truth (capture ended early)
+20260520 no full-day high/low for the truth (capture ended early)
+20260623 no full-day high/low for the truth (capture ended early)
