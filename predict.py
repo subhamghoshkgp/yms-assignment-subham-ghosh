@@ -1,72 +1,61 @@
-"""Predict an intraday breach using only information available before the open."""
+"""Write one pre-open 2% band-breach prediction per stock for the requested date."""
 import argparse
 import csv
-import math
+from math import isfinite, log
 from pathlib import Path
 
+THRESHOLD = 45.0
 
-def positive(row, column):
+
+def positive(row, key):
     try:
-        x = float(row[column])
+        value = float(row[key])
     except (KeyError, ValueError, TypeError):
         return None
-    return x if math.isfinite(x) and x > 0 else None
+    return value if isfinite(value) and value > 0 else None
 
 
-def clamp(value, low, high):
-    return min(high, max(low, value))
+def predict(iv, turnover, row):
+    if row["results_at_ist"]:
+        return True
+    volatility = (iv ** 0.45 * (12 * float(row["range_5d"])) ** 0.30
+                  * (12 * float(row["range_22d"])) ** 0.15 * (12 * float(row["range_1d"])) ** 0.05
+                  * (20 * float(row["abs_return_22d"])) ** 0.05)
+    market = min(5, abs(float(row["market_gap"])))
+    stock = min(5, abs(float(row["stock_gap"])))
+    india_vix = max(-1, min(1, log(float(row["india_vix"]) / 15)))
+    score = (volatility + 16 * (0.65 * stock + 0.35 * market) + 12 * india_vix
+             + 1.2 * log(turnover) + 10 * int(row["met_last_session"]) + 5 * int(row["meeting_today"]))
+    return score >= THRESHOLD
 
 
-def sessions(directory, through):
-    for path in sorted(directory.glob("*_n50.info.csv")):
-        date = path.name[:8]
-        if date <= through:
-            with path.open(newline="") as f:
-                yield date, list(csv.DictReader(f))
-
-
-def features(history):
-    """Update stock histories once per observed session, including its pre-open row."""
-    states = {}
-    for date, rows in history:
-        stock_features = {}
-        for row in rows:
-            name = row["name"]
-            state = states.setdefault(name, {})
-            for col in ("vix", "vix_1m"):
-                value = positive(row, col)
+def predict_date(date, historical_info, user_info):
+    last_iv, monthly_iv = {}, {}
+    today_path = historical_info / f"{date}_n50.info.csv"
+    if not today_path.is_file():
+        raise ValueError(f"missing info file for {date}")
+    for path in sorted(historical_info.glob("*_n50.info.csv")):
+        session = path.name[:8]
+        if session > date:
+            break
+        with path.open(newline="") as stream:
+            today = list(csv.DictReader(stream))
+        for r in today:
+            for key, state in (("vix", last_iv), ("vix_1m", monthly_iv)):
+                value = positive(r, key)
                 if value is not None:
-                    state[col] = value
-            iv = state.get("vix", state.get("vix_1m", 23.0))
-            normal_iv = state.get("vix_1m", iv)
-            close, high, low = (positive(row, k) for k in ("pclose", "phi", "plo"))
-            if close and high and low and high > low:
-                price_range = clamp(100 * (high - low) / close, 0.25, 14.0)
-                old_range = state.get("range", iv / 12.0)
-                state["range"] = 0.15 * price_range + 0.85 * old_range
-            else:
-                price_range = state.get("range", iv / 12.0)
-            recent_range = state.get("range", price_range)
-            volume, usual = positive(row, "pvolume"), positive(row, "mddv_20")
-            turnover = clamp(volume / usual, 0.25, 6.0) if volume and usual else 1.0
-            stock_features[name] = (iv, normal_iv, price_range, recent_range, turnover)
-        yield date, stock_features
-
-
-def risk_score(stock, global_row):
-    iv, normal_iv, last_range, avg_range, turnover = stock
-    # Put percentage high-low ranges on a scale comparable with annualized IV.
-    base = iv ** 0.65 * (12 * avg_range) ** 0.30 * (12 * last_range) ** 0.05
-    base *= clamp(iv / normal_iv, 0.7, 1.5) ** 0.15 * turnover ** 0.05
-    index_gap = abs(float(global_row["india_etf_gap_pct"]))
-    stock_gap = abs(float(global_row["stock_gap_pct"]))
-    overnight = min(0.3 * index_gap + 0.7 * stock_gap, 4.0)
-    spx_move = min(abs(float(global_row["spx_return_pct"])), 3.0)
-    japan_move = min(abs(float(global_row["nikkei_open_gap_pct"])), 3.0)
-    return base + 4 * overnight + 2 * spx_move + 8 * japan_move
-
-
-THRESHOLD = 44.0
+                    state[r["name"]] = value
+        if session == date:
+            break
+    with user_info.open(newline="") as stream:
+        context = {r["name"]: r for r in csv.DictReader(stream) if r["date"] == date}
+    predictions = []
+    for r in today:
+        name = r["name"]
+        volume, typical = positive(r, "pvolume"), positive(r, "mddv_20")
+        turnover = max(0.3, min(5, volume / typical)) if volume and typical else 1
+        predictions.append((name, predict(last_iv.get(name, monthly_iv.get(name, 23)), turnover, context[name])))
+    return predictions
 
 
 def main():
@@ -76,19 +65,12 @@ def main():
     parser.add_argument("--user-historical-info", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args()
-    for date, day in features(sessions(args.historical_info, args.date)):
-        if date == args.date:
-            break
-    else:
-        parser.error(f"missing historical info for {args.date}")
-    with args.user_historical_info.open(newline="") as f:
-        global_rows = {r["name"]: r for r in csv.DictReader(f) if r["date"] == date}
-    scores = {name: risk_score(stock, global_rows[name]) for name, stock in day.items()}
+    rows = predict_date(args.date, args.historical_info, args.user_historical_info)
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    with (args.out_dir / f"{date}.predictions.csv").open("w", newline="") as f:
-        writer = csv.writer(f, lineterminator="\n")
+    with (args.out_dir / f"{args.date}.predictions.csv").open("w", newline="") as stream:
+        writer = csv.writer(stream, lineterminator="\n")
         writer.writerow(["name", "prediction"])
-        writer.writerows((name, score >= THRESHOLD) for name, score in scores.items())
+        writer.writerows(rows)
 
 
 if __name__ == "__main__":

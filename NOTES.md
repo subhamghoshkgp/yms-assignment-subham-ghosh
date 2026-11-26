@@ -1,34 +1,49 @@
-# Predicting a 2% intraday move before the Nifty opens
+# Model and validation
 
-The target is a breach of either side of the band around yesterday’s close. The predictor produces one Boolean per stock and runs offline using only the supplied pre-open history and the submitted CSV.
+## What the model knows at 09:15 IST
 
-## Signals
+| Signal | Construction and cutoff |
+|---|---|
+| Stock volatility | Use the latest available stock option IV, the last completed NSE high–low range, its 5- and 22-session averages, and the mean absolute close-to-close return over 22 sessions. Domestic price observations have exchange dates strictly earlier than the prediction date. |
+| Market opening gap | Convert the two Tokyo Nifty ETFs and the Hong Kong Sensex ETF into rupees. Compare each value with the previous Nifty close after centering the fund/index ratio on five earlier overlapping trading sessions. Combine these signals with US futures, Asian indices and Brent. |
+| Stock opening gap | Multiply the estimated market gap by a 50-session stock beta, shrunk toward one. Adjust it for the US-listed ADR’s repricing where available and for peer ADRs in banking, IT and pharmaceuticals. |
+| Market conditions | Use the previous India VIX close and yesterday’s traded value relative to its 20-session median. The assignment IV carries forward when a practice row is masked. |
+| Earnings | Read the exchange dissemination time from NSE corporate announcements. A financial-results filing since the previous stock session’s 15:30 close and strictly before 09:15 triggers a flag. Notices from earlier daily NSE PR archives separately identify scheduled meetings today or in the last index session. |
 
-- **Stock volatility.** The base score is a weighted geometric mean of annualized implied volatility (65%), an exponentially smoothed previous-session high–low range (30%), and the most recent range (5%). Ranges are percentages of the previous close and are multiplied by 12 to put them on a comparable scale. The range smoother gives 15% weight to each new observation. Small adjustments account for implied volatility relative to its one-month average and turnover relative to its 20-session median. Missing observations use earlier values for the same stock. An unseen stock starts with a neutral IV of 23 if both IV fields are missing.
-- **Overnight repricing.** Compare US closing prices of INDY and INDA with the latest previous Nifty close. Measure each log price ratio against its median over the five earlier matched sessions. This centers differences in price levels and persistent fund premiums. INDY receives 65% weight and INDA 35%. For HDFC Bank, ICICI Bank, Infosys, Wipro and Dr. Reddy’s, the corresponding ADR/local price ratio supplies a stock-specific signal. These ratios also reflect currency and tracking differences.
-- **Global moves.** The latest completed S&P 500 close-to-close return and the Nikkei 225 opening gap provide two additional measures of market stress. All US and Indian closing prices have local session dates strictly earlier than the target date. The Nikkei normally opens at 05:30 IST. Only the Japanese opening value is used from the target session, against a strictly earlier close. An absent or late Japanese opening bar contributes zero.
-- **Decision.** Add four times the overnight gap magnitude, twice the absolute S&P return and eight times the absolute Japanese opening gap to the base score. The overnight magnitude uses 70% stock and 30% index signals, capped at 4 percentage points. The other two magnitudes are each capped at 3 points. Predict a breach at a score of 44 or higher. This score is an index, not a calibrated probability.
+The CSV’s `local_asof` is the last domestic stock price date. Nonempty `results_at_ist` entries preserve the filing’s timestamp and UTC offset. For foreign hourly bars, the availability check adds a full hour to the bar’s start and requires that time to be **strictly earlier** than the cutoff. A 09:00–10:00 IST bar is therefore ineligible. The evaluator provides each stock’s date-specific IV and turnover directly at prediction time.
 
-## Training-only selection
+## Decision rule
 
-The first 66 supplied training dates were used for model and threshold selection, examined in three consecutive 22-date blocks. The last 31 training dates were held back for a single chronological check. No random stock-row split was used. The selection compared IV alone, heavier weighting of realized ranges, a Monday adjustment, US-market-only signals, and combinations of ETF/ADR and Japanese opening signals. The selection favored the highest aggregate grading score among the final candidates with at least 73% development precision. The Monday adjustment reduced the score in the US-market comparison.
+1. Form a weighted geometric mean of stock IV and rescaled realized volatility. The weights for IV, weekly range, monthly range, yesterday’s range and monthly absolute return are 45%, 30%, 15%, 5% and 5%. Percentage ranges are multiplied by 12 and absolute returns by 20 to put their magnitudes on a comparable scale. Cap an individual historical range at 12% and an absolute daily return at 10%.
+2. Add 16 times the weighted magnitude of the predicted stock and index gaps. The weights are 65% and 35%, and each magnitude is capped at 5 percentage points. Add 12 times the clipped log of India VIX divided by 15, and 1.2 times the log of relative turnover.
+3. Add 5 points for a previously announced results meeting today and 10 for one in the last index session. Flag scores of **45 or more**, as well as stocks with fresh results filings. A score of 45 is a decision threshold on this scale.
 
-| Training period | Correct flags / all flags | Actual moves | Precision | Recall | Score |
-|---|---:|---:|---:|---:|---:|
-| Development, March 4–August 7 | 628 / 836 | 1,535 | 75.1% | 40.9% | 0.7882 |
-| Held back, August 10–October 30 | 26 / 43 | 461 | 60.5% | 5.6% | 0.4198 |
+## Model selection
 
-The later period had fewer large moves and the model flagged very few of them. Its precision estimate rests on just 43 flags. All tuning and selection used training dates only. The published grading files were reserved for running the official evaluator after the model was fixed.
+The opening-gap regression used 267 Nifty sessions between February 2025 and the start of the assignment in March 2026. Its target was the historical Nifty open relative to the previous close. All five inputs were available before that open. Ridge regression used an intercept and a penalty of 5. In a time split starting validation in October 2025, combining the Tokyo and Hong Kong signals gave an opening-gap mean absolute error of 0.228 percentage points and an R² of 0.559. The coefficients in `market_features.py` then used the full pre-assignment window.
 
-## Reproduction
+For the stock decision, the first 66 assignment **training** dates served as development data, in three successive blocks of 22. Experiments compared the original model, multihorizon volatility blends, pre-period logistic regression, shallow gradient boosting, expanding logistic fits, and overnight-risk models with and without sector commodity shocks. The final search maximized the assignment score among candidates with at least 75% pooled precision and 62% precision in each development block. The selected model’s block precisions were 80.8%, 65.1% and 62.2%.
 
-Run from the repository root. The checked-in CSV covers all 6,900 date/stock pairs. Regenerating it requires internet access. The generator reads unadjusted daily OHLC fields from Yahoo Finance’s chart endpoint, using exchange-local dates. The two as-of columns identify the S&P session and whether a Japanese opening observation was used. The ETF/ADR alignment handles US and Indian holidays separately. Archived vendor prices can be corrected after the fact.
+The following 31 training dates served as a chronological check. The earlier model’s official score was already known from the prior submission. The new model used training dates for selection and its threshold was fixed before its official evaluation.
 
-```sh
-python -m pip install -r requirements.txt
-python prepare_user_historical_info.py --out user_historical_info.csv
-python evaluator/run_evaluation.py .
-python evaluator/run_evaluation.py . --data evaluator/data
-```
+| Period | Model | Correct flags / flags | Actual moves | Precision | Recall | Score |
+|---|---|---:|---:|---:|---:|---:|
+| First 66 training dates | Previous | 628 / 836 | 1,535 | 75.12% | 40.91% | 0.7882 |
+| First 66 training dates | Current | 781 / 1,030 | 1,535 | 75.83% | 50.88% | 0.8219 |
+| Later 31 training dates | Previous | 26 / 43 | 461 | 60.47% | 5.64% | 0.4198 |
+| Later 31 training dates | Current | 33 / 42 | 461 | 78.57% | 7.16% | 0.4742 |
+| Official test, 41 dates | Previous | 172 / 282 | 706 | 60.99% | 24.36% | 0.6658 |
+| Official test, 41 dates | Current | 208 / 303 | 706 | 68.65% | 29.46% | 0.7178 |
 
-Nikkei publishes the time of its first index calculation in its [index FAQ](https://indexes.nikkei.co.jp/nkave/archives/faq/faq_nikkei_stock_average_en.pdf).
+A second feature build from the cached source responses reproduced the evaluated CSV byte for byte. The production predictor also matched the research decisions on all 4,850 training stock-days.
+
+## Limitations
+
+The model flags few stocks in quiet sessions. On the later training dates it missed 428 of 461 moves. Foreign ETFs can deviate from the underlying through currency effects, thin trading and tracking error. If an Asian market is closed, the gap estimate falls back to available markets. A published meeting notice records the schedule known on the publication date and can subsequently be revised. Exchange and vendor histories can also change, and intraday download retention is finite. The checked-in CSV preserves the evaluated inputs.
+
+## Research and data sources
+
+- Prior work on foreign-market information and opening gaps motivated the overnight signals. [De Gooijer, Diks and Gatarek](https://cendef.uva.nl/binaries/content/assets/subsites/amsterdam-school-of-economics/amsterdam-school-of-economics-research-institute/cendef/working-papers-2009/information---nfda_cendef_wp_0913.pdf)
+- Multihorizon volatility research and an open implementation of the Optiver volatility task motivated testing rolling windows and boosted trees. [Journal of Econometrics](https://doi.org/10.1016/j.jeconom.2010.03.029) · [Optiver implementation](https://github.com/scottgrew/optiver-volatility)
+- Instrument definitions for Tokyo tickers 1678 and 201A and Hong Kong ticker 2836. [Japan Exchange Group](https://www.jpx.co.jp/english/equities/products/etfs/issues/01-08.html) · [BlackRock prospectus](https://www.blackrock.com/hk/en/literature/prospectus/20250630-ishares-core-sp-bse-sensex-india-etf-prospectus-hk-en.pdf)
+- Market prices come from Yahoo Finance charts. Corporate notices come from NSE filings and daily price-report archives. [Yahoo Finance](https://finance.yahoo.com/) · [NSE corporate announcements](https://www.nseindia.com/companies-listing/corporate-filings-announcements)

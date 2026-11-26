@@ -1,72 +1,89 @@
-"""Build point-in-time global market features for the Nifty-50 assignment."""
+"""Build stock features from quotes and disclosures available before 09:15 IST."""
 import argparse
 import csv
-import json
-import math
 from bisect import bisect_left
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, timedelta
+from math import log
 from pathlib import Path
-from statistics import median
-from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
-from zoneinfo import ZoneInfo
+
+from market_data import announcements, board_notices, chart
+from market_features import (Hourly, RelativePrice, StockHistory, average_present,
+                             daily, filings, latest_results, market_gaps, opening_gap)
 
 ADRS = {"HDFCBANK": "HDB", "ICICIBANK": "IBN", "INFY": "INFY", "WIPRO": "WIT", "DRREDDY": "RDY"}
-PAIRS = {"INDY": "^NSEI", "INDA": "^NSEI", **{adr: name + ".NS" for name, adr in ADRS.items()}}
+SECTORS = [
+    (("TCS", "HCLTECH", "TECHM", "INFY", "WIPRO"), ("INFY", "WIPRO")),
+    (("HDFCBANK", "ICICIBANK", "KOTAKBANK", "AXISBANK", "SBIN"), ("HDFCBANK", "ICICIBANK")),
+    (("DRREDDY", "SUNPHARMA", "CIPLA"), ("DRREDDY",)),
+]
+HOUR_SERIES = ("1678.T", "201A.T", "2836.HK", "JPYINR=X", "HKDINR=X", "^NSEI",
+               "ES=F", "NQ=F", "^N225", "^HSI", "BZ=F")
+HEADER = ("date", "name", "local_asof", "range_1d", "range_5d", "range_22d", "abs_return_22d",
+          "india_vix", "market_gap", "stock_gap", "results_at_ist", "meeting_today", "met_last_session")
 
 
-def load_quotes(symbol, start, end):
-    def unix_day(day):
-        return int(datetime.combine(day, time(), timezone.utc).timestamp())
+def generate(dates, names, cache):
+    first, last = dates[0], dates[-1]
+    start = first - timedelta(days=130)
+    daily_symbols = set(ADRS.values()) | {"INDY", "INDA", "^NSEI", "^INDIAVIX"}
+    daily_symbols.update(name + ".NS" for name in set(names) | ADRS.keys())
 
-    params = urlencode({"period1": unix_day(start), "period2": unix_day(end + timedelta(days=1)), "interval": "1d"})
-    for host in ("query2", "query1"):
-        url = f"https://{host}.finance.yahoo.com/v8/finance/chart/{quote(symbol, safe='')}?{params}"
-        try:
-            with urlopen(Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=30) as response:
-                result = json.load(response)["chart"]["result"][0]
-            zone = ZoneInfo(result["meta"]["exchangeTimezoneName"])
-            fields = result["indicators"]["quote"][0]
-            bars = {}
-            for stamp, opening, closing in zip(result["timestamp"], fields["open"], fields["close"]):
-                instant = datetime.fromtimestamp(stamp, zone)
-                bars[instant.date()] = (opening, closing, instant)
-            if not bars:
-                raise ValueError("empty quote history")
-            return bars
-        except (OSError, KeyError, IndexError, TypeError, ValueError) as exc:
-            if host == "query1":
-                raise RuntimeError(f"could not load {symbol}") from exc
+    def quote_series(key):
+        symbol, interval = key
+        end = last + timedelta(days=1) if interval == "1h" else last
+        data = chart(symbol, start, end, interval, cache)
+        return Hourly(data) if interval == "1h" else daily(data)
 
+    keys = [(s, "1d") for s in sorted(daily_symbols)] + [(s, "1h") for s in HOUR_SERIES]
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        quotes = dict(zip(keys, pool.map(quote_series, keys)))
+        index = quotes["^NSEI", "1d"]
+        index_days = sorted(index)
+        index_returns = {b: log(index[b][3] / index[a][3]) for a, b in zip(index_days, index_days[1:])}
+        stocks = {s: StockHistory(quotes[s + ".NS", "1d"]) for s in names}
+        vix = quotes["^INDIAVIX", "1d"]
+        vix_days = sorted(vix)
+        hourly = {s: quotes[s, "1h"] for s in HOUR_SERIES}
+        markets = market_gaps(dates, hourly, index)
+        adr_pairs = {s: RelativePrice(quotes[a, "1d"], quotes[s + ".NS", "1d"]) for s, a in ADRS.items()}
+        etf_pairs = [RelativePrice(quotes[s, "1d"], index) for s in ("INDY", "INDA")]
 
-def valid(value):
-    return value is not None and math.isfinite(value) and value > 0
+        def results(s):
+            rows = announcements(s, first - timedelta(days=31), last, cache)
+            return filings(rows, s)
+        releases = dict(zip(names, pool.map(results, names)))
+        # Only older published snapshots can establish a schedule.
+        notice_days = [d for d in index_days if first - timedelta(days=22) <= d < last]
+        notices = defaultdict(dict)
+        for publication, rows in zip(notice_days, pool.map(lambda d: board_notices(d, cache), notice_days)):
+            for symbol, text in rows:
+                meeting = date.fromisoformat(text)
+                if publication < meeting:
+                    notices[symbol].setdefault(meeting, publication)
 
-
-def before(days, target):
-    i = bisect_left(days, target) - 1
-    if i < 0 or (target - days[i]).days > 10:
-        raise ValueError(f"missing recent close before {target}")
-    return days[i]
-
-
-class RelativePrice:
-    """US/local closing-price ratio relative to its preceding five matched sessions."""
-    def __init__(self, us, india):
-        self.us, self.india = us, india
-        self.us_days, self.india_days = sorted(us), sorted(india)
-        self.paired = sorted(us.keys() & india.keys())
-        self.logs = [math.log(us[d] / india[d]) for d in self.paired]
-
-    def gap(self, target):
-        us_day = before(self.us_days, target)
-        india_day = before(self.india_days, target)
-        stop = bisect_left(self.paired, min(us_day, india_day))
-        if stop < 5:
-            raise ValueError(f"insufficient paired history before {target}")
-        current = math.log(self.us[us_day] / self.india[india_day])
-        return 100 * (current - median(self.logs[stop-5:stop]))
+    for target in dates:
+        i = bisect_left(index_days, target)
+        j = bisect_left(vix_days, target)
+        if i == 0 or j == 0:
+            raise ValueError(f"missing previous index session before {target}")
+        index_window = index_days[max(0, i-50):i]
+        previous_index = index_days[i-1]
+        market = opening_gap(markets[target])
+        us_index = 0.65 * etf_pairs[0].gap(target) + 0.35 * etf_pairs[1].gap(target)
+        residual = {s: pair.gap(target) - us_index for s, pair in adr_pairs.items()}
+        sector = {s: average_present([residual[p] for p in peers]) for members, peers in SECTORS for s in members}
+        for name in names:
+            stock = stocks[name]
+            asof, last_range, week, month, abs_move = stock.recent(target)
+            beta = stock.beta(index_window, index_returns)
+            stock_gap = beta * market + 0.4 * sector.get(name, 0) + 0.25 * residual.get(name, 0)
+            result = latest_results(releases[name], asof, target)
+            values = (last_range, week, month, abs_move, vix[vix_days[j-1]][3], market, stock_gap)
+            yield (target.strftime("%Y%m%d"), name, asof, *(round(v, 7) for v in values),
+                   result.isoformat() if result else "", int(target in notices[name]),
+                   int(previous_index in notices[name]))
 
 
 def main():
@@ -74,41 +91,15 @@ def main():
     parser.add_argument("--dates", type=Path, default=Path("data/all_dates.txt"))
     parser.add_argument("--names", type=Path, default=Path("data/n50_names.txt"))
     parser.add_argument("--out", type=Path, default=Path("user_historical_info.csv"))
+    parser.add_argument("--cache-dir", type=Path, help="Reuse downloaded quotes and public exchange records")
     args = parser.parse_args()
     dates = sorted(datetime.strptime(d, "%Y%m%d").date() for d in args.dates.read_text().split())
     names = args.names.read_text().split()
-    symbols = sorted(set(PAIRS) | set(PAIRS.values()) | {"^GSPC", "^N225"})
-    start = dates[0] - timedelta(days=48)
-    def fetch(symbol):
-        end = dates[-1] if symbol == "^N225" else dates[-1] - timedelta(days=1)
-        return load_quotes(symbol, start, end)
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        bars = dict(zip(symbols, pool.map(fetch, symbols)))
-    closes = {s: {d: bar[1] for d, bar in series.items() if valid(bar[1])} for s, series in bars.items()}
-    pairs = {s: RelativePrice(closes[s], closes[local]) for s, local in PAIRS.items()}
-    us_days, jp_days = sorted(closes["^GSPC"]), sorted(closes["^N225"])
-    records = []
-    for target in dates:
-        us_day = before(us_days, target)
-        spx = closes["^GSPC"]
-        spx_return = 100 * (spx[us_day] / spx[before(us_days, us_day)] - 1)
-        # The Nikkei opens at 09:00 JST (05:30 IST). Ignore a late or absent bar.
-        opening_bar = bars["^N225"].get(target)
-        cutoff = datetime.combine(target, time(9, 15), ZoneInfo("Asia/Kolkata"))
-        jp_gap = 0.0
-        has_open = opening_bar and valid(opening_bar[0]) and opening_bar[2] < cutoff
-        if has_open:
-            jp_gap = 100 * (opening_bar[0] / closes["^N225"][before(jp_days, target)] - 1)
-        market = 0.65 * pairs["INDY"].gap(target) + 0.35 * pairs["INDA"].gap(target)
-        for name in names:
-            stock = pairs[ADRS[name]].gap(target) if name in ADRS else market
-            records.append((target.strftime("%Y%m%d"), name, us_day, target if has_open else "",
-                            round(spx_return, 6), round(jp_gap, 6), round(market, 6), round(stock, 6)))
-    with args.out.open("w", newline="") as f:
-        writer = csv.writer(f, lineterminator="\n")
-        writer.writerow(["date", "name", "spx_asof", "nikkei_open_asof", "spx_return_pct",
-                         "nikkei_open_gap_pct", "india_etf_gap_pct", "stock_gap_pct"])
+    records = list(generate(dates, names, args.cache_dir))
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with args.out.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream, lineterminator="\n")
+        writer.writerow(HEADER)
         writer.writerows(records)
 
 
